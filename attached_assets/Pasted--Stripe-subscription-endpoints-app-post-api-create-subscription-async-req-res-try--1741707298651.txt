@@ -1,0 +1,197 @@
+// Stripe subscription endpoints
+app.post("/api/create-subscription", async (req, res) => {
+  try {
+    const { user_id, price_id, customer_email, return_url } = req.body;
+
+    if (!user_id || !price_id || !customer_email || !return_url) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing required fields",
+      });
+    }
+
+    // Check if user already has subscription data in Firestore
+    const userRef = db.collection("users").doc(user_id);
+    const userDoc = await userRef.get();
+    const userData = userDoc.data();
+    
+    let customer;
+    
+    // If user already has a Stripe customer ID, use it; otherwise, create a new customer
+    if (userData?.stripeCustomerId) {
+      customer = await stripe.customers.retrieve(userData.stripeCustomerId);
+    } else {
+      // Create a new customer in Stripe
+      customer = await stripe.customers.create({
+        email: customer_email,
+        metadata: {
+          firebaseUserId: user_id,
+        },
+      });
+      
+      // Save Stripe customer ID to Firestore
+      await userRef.set({
+        stripeCustomerId: customer.id,
+      }, { merge: true });
+    }
+
+    // Create a subscription checkout session
+    const session = await stripe.checkout.sessions.create({
+      customer: customer.id,
+      payment_method_types: ["card"],
+      mode: "subscription",
+      billing_address_collection: "auto",
+      line_items: [
+        {
+          price: price_id,
+          quantity: 1,
+        },
+      ],
+      metadata: {
+        user_id,
+      },
+      success_url: `${return_url}?success=true&session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${return_url}?canceled=true`,
+    });
+
+    res.json({
+      success: true,
+      sessionId: session.id,
+      sessionUrl: session.url,
+    });
+  } catch (error) {
+    console.error("Error creating subscription:", error);
+    res.status(500).json({
+      success: false,
+      error: error.message || "Failed to create subscription",
+    });
+  }
+});
+
+// Get subscription information
+app.get("/api/subscription/:user_id", async (req, res) => {
+  try {
+    const { user_id } = req.params;
+    
+    // Get user data from Firestore to find Stripe customer ID
+    const userRef = db.collection("users").doc(user_id);
+    const userDoc = await userRef.get();
+    const userData = userDoc.data();
+    
+    if (!userData?.stripeCustomerId) {
+      return res.json({
+        success: true,
+        hasActiveSubscription: false,
+      });
+    }
+    
+    // Get customer's subscriptions
+    const subscriptions = await stripe.subscriptions.list({
+      customer: userData.stripeCustomerId,
+      status: "active",
+      expand: ["data.default_payment_method"],
+    });
+    
+    if (subscriptions.data.length === 0) {
+      return res.json({
+        success: true,
+        hasActiveSubscription: false,
+      });
+    }
+    
+    // Return the active subscription data
+    res.json({
+      success: true,
+      hasActiveSubscription: true,
+      subscription: subscriptions.data[0],
+    });
+  } catch (error) {
+    console.error("Error fetching subscription:", error);
+    res.status(500).json({
+      success: false,
+      error: error.message || "Failed to fetch subscription",
+    });
+  }
+});
+
+// Stripe webhook for handling subscription events
+app.post("/api/webhook", express.raw({type: 'application/json'}), async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  let event;
+
+  try {
+    // Verify the webhook signature
+    event = stripe.webhooks.constructEvent(
+      req.body,
+      sig,
+      'whsec_your_webhook_signing_secret'
+    );
+  } catch (err) {
+    console.error(`Webhook Error: ${err.message}`);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  // Handle the event
+  switch (event.type) {
+    case 'invoice.payment_succeeded':
+      const invoice = event.data.object;
+      // Handle successful payment
+      if (invoice.billing_reason === 'subscription_create') {
+        const subscription = await stripe.subscriptions.retrieve(invoice.subscription);
+        await handleSuccessfulSubscription(subscription);
+      }
+      break;
+    case 'customer.subscription.updated':
+    case 'customer.subscription.deleted':
+      const subscription = event.data.object;
+      await handleSubscriptionChange(subscription);
+      break;
+    default:
+      // Unexpected event type
+      console.log(`Unhandled event type ${event.type}`);
+  }
+
+  res.send();
+});
+
+// Helper function to handle successful subscription
+async function handleSuccessfulSubscription(subscription) {
+  const customerId = subscription.customer;
+  const customer = await stripe.customers.retrieve(customerId);
+  const userId = customer.metadata.firebaseUserId;
+  
+  if (userId) {
+    // Update user's subscription status in Firestore
+    const userRef = db.collection("users").doc(userId);
+    await userRef.set({
+      subscriptionStatus: 'active',
+      subscriptionId: subscription.id,
+      subscriptionPriceId: subscription.items.data[0].price.id,
+      subscriptionCurrentPeriodEnd: new Date(subscription.current_period_end * 1000),
+    }, { merge: true });
+  }
+}
+
+// Helper function to handle subscription changes
+async function handleSubscriptionChange(subscription) {
+  const customerId = subscription.customer;
+  const customer = await stripe.customers.retrieve(customerId);
+  const userId = customer.metadata.firebaseUserId;
+  
+  if (userId) {
+    const userRef = db.collection("users").doc(userId);
+    
+    if (subscription.status === 'active') {
+      await userRef.set({
+        subscriptionStatus: 'active',
+        subscriptionId: subscription.id,
+        subscriptionCurrentPeriodEnd: new Date(subscription.current_period_end * 1000),
+      }, { merge: true });
+    } else if (subscription.status === 'canceled') {
+      await userRef.set({
+        subscriptionStatus: 'canceled',
+        subscriptionCanceledAt: new Date(subscription.canceled_at * 1000),
+      }, { merge: true });
+    }
+  }
+}
